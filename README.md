@@ -16,12 +16,12 @@
 
 ## 它怎么工作
 
-它先顺着进程树往上找到**最近的**那个 Claude Code 进程——只认最近这一个，绝不越级到更上层的父会话——然后按它的类型自动选投递方式：
+它先顺着进程树往上找到最近的那个 Claude Code 进程——只认最近这一个，绝不越级到更上层的父会话——然后按它的类型自动选投递方式：
 
-- 会话跑在 **tmux** 里：用 `tmux send-keys` 发到你的窗格，不需要 root；
-- 会话是**普通交互式**（那个 pts 是它的控制终端）：用 `TIOCSTI` 把这行字塞进 pts，需要 root；
-- 会话是 **daemon 托管的后台会话**（`claude --bg`、手机 remote 那套）：它的输入不走 pts、走一个 unix socket `rv/<会话id>.sock`，所以改用官方客户端 `claude attach <id>` 连上去注入；
-- 会话是 **headless 的 `claude -p`**（标准输入是管道）：没有任何交互输入通道，直接拒绝。
+- 会话跑在 tmux 里：用 `tmux send-keys` 发到你的窗格，不需要 root；
+- 普通交互式会话（那个 pts 是它的控制终端）：用 `TIOCSTI` 把这行字塞进 pts，需要 root；
+- daemon 托管的后台会话（`claude --bg`、手机 remote 那套）：它的输入不走 pts、走一个 unix socket `rv/<会话id>.sock`，所以改用官方客户端 `claude attach <id>` 连上去注入；
+- headless 的 `claude -p`（标准输入是管道）：没有任何交互输入通道，直接拒绝。
 
 选好通道后，会话把 `/goal <条件>` 当成普通输入收下，真正的 `/goal` 就生效了：右下角的 `◎ /goal active` 计时标、独立的完成判定、不到目标不收工。
 
@@ -68,7 +68,7 @@ sudo ln -s "$PWD/claude-self-goal" /usr/local/bin/claude-self-goal
 
 退出码：`0` 成功，`2` 用法错误，`3` 没找到可注入的目标，`4` 非 root（tiocsti），`5` 注入失败，`6` 条件里有控制字符。
 
-goal 条件会先过一道净化：任何控制字符（回车、换行、ESC 等）都会被拒，所以这行文字没法夹带第二条命令。命令行上的条件也**记得用引号括起来**——不然多词条件在 bash 里会被拆成多个参数、在 zsh 里行为还不一样。
+goal 条件会先过一道净化：任何控制字符（回车、换行、ESC 等）都会被拒，所以这行文字没法夹带第二条命令。命令行上的条件记得用引号括起来——不然多词条件在 bash 里会被拆成多个参数、在 zsh 里行为还不一样。
 
 设了环境变量 `CLAUDE_SELF_GOAL_DRY_RUN=1`，工具就只 dry-run、绝不注入——测试和 CI 用它当硬性保险。
 
