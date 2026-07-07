@@ -2,35 +2,43 @@
 
 简体中文 · [English](./README.en.md)
 
-让正在运行的 Claude Code 会话给自己设一个原生 `/goal`——不用人敲、不需要 tmux、也不走 `claude -p`,后台会话同样能用。
+让正在运行的 Claude Code 会话给自己设一个原生 `/goal`——不用人敲，交互式、tmux、还是后台会话都能用。
 
-> Claude Code 的 `/goal <条件>`(v2.1.139 起)会让会话一直干到某个条件满足才停,中途每次想收工都由一个独立的判定器检查条件到了没有。这条命令平时只能人手动敲；claude-self-goal 把同样一行字从程序里送进会话，于是一个自主 agent 能给自己定目标。
+> Claude Code 的 `/goal <条件>`(v2.1.139 起)会让会话一直干到某个条件满足才停，中途每次想收工都由一个独立的判定器检查条件到了没有。这条命令平时只能人手动敲；claude-self-goal 把同样一行字从程序里送进会话，于是一个自主 agent 能给自己定目标。
 
-在 Claude Code v2.1.202、Linux、root 下验证通过。
+在 Claude Code v2.1.202、Linux 上验证通过。
 
 ## 它解决什么问题
 
 设置原生 `/goal` 没有任何程序化入口——没有 hook 字段，没有 `settings.json` 选项，没有环境变量，没有命令行参数，也没有 API。hook 被明确设计成不能触发 slash 命令，而 `claude -p "/goal ..."` 在 v2.1.202 上会卡死。要让原生的 goal 机制真正转起来，唯一的办法是把 `/goal <条件>` 这行文字送进会话的输入，跟人手敲进去一模一样。
 
-如果会话跑在 tmux 里，这件事 `tmux send-keys` 就能做。难的是后台、不在 tmux 的会话——它根本没有一个窗格可以打字。claude-self-goal 把这两种情况都接上了。
+难点在于不同类型的会话，输入进去的通道不一样。claude-self-goal 会先认出你是哪种会话，再挑对的通道。
 
 ## 它怎么工作
 
-分两步。先顺着进程树往上找，定位到你所在的那个 Claude Code 进程，条件是它的标准输入和标准输出指向同一个 pts。这一步是“失败即停”的：找不到这样的 Claude 祖先进程，就直接拒绝，绝不会随便挑一个终端往里塞。找到之后，按环境自动选投递方式——在 tmux 里就用 `tmux send-keys` 发到你的窗格，不需要 root；不在 tmux 就用 `TIOCSTI` 把这行字塞进那个 pts，这条需要 root。
+它先顺着进程树往上找到**最近的**那个 Claude Code 进程——只认最近这一个，绝不越级到更上层的父会话——然后按它的类型自动选投递方式：
 
-会话把它当成普通输入收下，于是真正的 `/goal` 生效：右下角的 `◎ /goal active` 计时标、独立的完成判定、以及不到目标不收工。要是你在会话正忙的时候设的，它会先排队，等当前这一轮结束再落地。
+- 会话跑在 **tmux** 里：用 `tmux send-keys` 发到你的窗格，不需要 root；
+- 会话是**普通交互式**（那个 pts 是它的控制终端）：用 `TIOCSTI` 把这行字塞进 pts，需要 root；
+- 会话是 **daemon 托管的后台会话**（`claude --bg`、手机 remote 那套）：它的输入不走 pts、走一个 unix socket `rv/<会话id>.sock`，所以改用官方客户端 `claude attach <id>` 连上去注入；
+- 会话是 **headless 的 `claude -p`**（标准输入是管道）：没有任何交互输入通道，直接拒绝。
+
+选好通道后，会话把 `/goal <条件>` 当成普通输入收下，真正的 `/goal` 就生效了：右下角的 `◎ /goal active` 计时标、独立的完成判定、不到目标不收工。
 
 ## 快速上手
 
 ```bash
-# 在 Claude Code 会话的 Bash 工具里（或一个 skill 里）：
+# 在 Claude Code 会话的 Bash 工具里（或一个 skill 里）。条件一定要用引号括起来：
 claude-self-goal "所有测试通过，并且构建是绿的"
 
 # 计划变了，提前清掉：
 claude-self-goal --clear
 
-# 只想看看它会做什么，先不真的注入：
+# 只想看它会走哪条通道、先不真的注入：
 claude-self-goal --dry-run "迁移已经完成"
+
+# 给另一个后台会话设目标（一个调度者给 worker 下目标）：
+claude-self-goal --session 994f658d "PR 的 CI 全绿"
 ```
 
 ## 安装
@@ -38,11 +46,10 @@ claude-self-goal --dry-run "迁移已经完成"
 ```bash
 git clone https://github.com/Windy3f3f3f3f/claude-self-goal.git
 cd claude-self-goal
-# 放进 PATH（用软链接，方便以后更新）：
 sudo ln -s "$PWD/claude-self-goal" /usr/local/bin/claude-self-goal
 ```
 
-需要 Python 3.6 以上和 Linux。tmux 那条路需要装 `tmux`；非 tmux 那条路需要 root（见“安全”一节）。
+需要 Python 3.6 以上和 Linux。tmux 那条路需要装 `tmux`；TIOCSTI 那条需要 root；attach 那条需要 `claude` 在 PATH 上。
 
 ## 当成 Claude Code skill 用
 
@@ -52,37 +59,36 @@ sudo ln -s "$PWD/claude-self-goal" /usr/local/bin/claude-self-goal
 
 | 命令 | 作用 |
 |---|---|
-| `claude-self-goal "<条件>"` | 给当前会话设一个原生 `/goal` |
+| `claude-self-goal "<条件>"` | 给当前会话设一个原生 `/goal`（自动选通道） |
 | `claude-self-goal --clear` | 清掉当前 goal（`/goal clear`） |
-| `claude-self-goal --dry-run "<条件>"` | 只打印选中的方式和目标，什么都不注入 |
-| `claude-self-goal --method tmux\|tiocsti\|auto` | 强制投递方式（默认 `auto`） |
-| `claude-self-goal --unsafe-pts /dev/pts/N ... --i-understand-this-can-inject-keystrokes` | 注入到指定的 pts（危险，跳过自动发现） |
+| `claude-self-goal --dry-run "<条件>"` | 只打印选中的通道和目标，什么都不注入 |
+| `claude-self-goal --session <id> "<条件>"` | 给指定的 daemon 后台会话设目标（跨会话） |
+| `claude-self-goal --method tmux\|tiocsti\|attach\|auto` | 强制某条通道（默认 `auto`） |
+| `claude-self-goal --unsafe-pts /dev/pts/N ... --i-understand-this-can-inject-keystrokes` | 注入到指定 pts（危险，跳过自动发现，强制 tiocsti） |
 
-退出码：`0` 成功，`2` 用法错误，`3` 没找到 Claude 目标，`4` 非 root（tiocsti 路），`5` 注入失败，`6` 条件里有控制字符。
+退出码：`0` 成功，`2` 用法错误，`3` 没找到可注入的目标，`4` 非 root（tiocsti），`5` 注入失败，`6` 条件里有控制字符。
 
-goal 条件会先过一道净化：任何控制字符（回车、换行、ESC 等）都会被拒，所以这行文字没法夹带第二条命令进会话。
+goal 条件会先过一道净化：任何控制字符（回车、换行、ESC 等）都会被拒，所以这行文字没法夹带第二条命令。命令行上的条件也**记得用引号括起来**——不然多词条件在 bash 里会被拆成多个参数、在 zsh 里行为还不一样。
+
+设了环境变量 `CLAUDE_SELF_GOAL_DRY_RUN=1`，工具就只 dry-run、绝不注入——测试和 CI 用它当硬性保险。
 
 ## 需要什么、有哪些限制
 
-只支持 Linux——自动发现靠 `/proc`，注入靠 Linux 的 `TIOCSTI`。非 tmux 那条路需要 root（或 `CAP_SYS_ADMIN`），tmux 那条不用。对着一个 headless 的 `claude -p` 会话不管用：它的标准输入是管道或 `/dev/null`，没有 pts 可以注入，而这种会话本来也跑不了交互式 `/goal`。它还跟 Claude Code 当前的输入处理绑得比较紧（在 v2.1.202 上验证过），将来界面或输入链路一变，可能就失效。
+只支持 Linux——发现靠 `/proc`，tiocsti 靠 Linux 的 `TIOCSTI` ioctl。TIOCSTI 那条需要 root（或 `CAP_SYS_ADMIN`，且内核/容器策略不拦），tmux 和 attach 那条不需要 root。headless 的 `claude -p`（标准输入是管道）没有交互输入通道，做不了。它还跟 Claude Code 当前的输入处理和 daemon 结构绑得比较紧（在 v2.1.202 上验证过），将来这些一变可能就失效。
 
 ## 安全
 
-这工具用到 `TIOCSTI`——一个内核默认收紧的“模拟键盘输入”特权操作。它是给你在自己控制的机器上、自动化你自己的 Claude Code 会话用的，不适合多用户或共享主机，也别拿去碰不属于你的会话。用之前请先读 [`SECURITY.md`](SECURITY.md)。
+tiocsti 那条用到 `TIOCSTI`——一个内核默认收紧的特权键盘注入原语；attach 那条用的是官方客户端。两条都是"往会话注入输入"，都是给你在自己控制的机器上、自动化你自己的 Claude Code 会话用的，不适合多用户或共享主机，`--session` 也只该指向你自己的后台会话。用之前请先读 [`SECURITY.md`](SECURITY.md)。
 
 ## 深入原理
 
-交互式会话和后台会话在终端上的拓扑差别、为什么每一种“非注入”的办法都走不通、这套机制到底怎么成立，都写在 [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md)。
-
-## 以后想做的
-
-给“新启动”的会话提供一条不需要 root 的路子：会话起来的时候就套一个小小的 pty 代理或 Unix socket wrapper，直接写 pty 的 master 端，从而绕开 `TIOCSTI`。这条覆盖不了已经在跑的会话（那正是现在这个版本管的事），但更安全、也更好移植。
+三类会话在终端/socket 上的拓扑差别、为什么 pts 注入对 daemon 会话无效、attach 怎么绕过、以及"只认最近祖先"为什么重要，都写在 [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md)。
 
 ## 测试
 
 ```bash
-./run-tests.sh                            # 发现 + 负例（是 root 的话再加 primitive）
-RUN_CLAUDE_INTEGRATION=1 ./run-tests.sh   # 再跑完整的端到端测试（需要 claude + root + 额度）
+./run-tests.sh                            # 发现 + 负例（是 root 再加 primitive）；bash/zsh/sh 都能跑
+RUN_CLAUDE_INTEGRATION=1 ./run-tests.sh   # 再跑两条端到端集成（tiocsti 与 attach 路径，需要 claude + 额度）
 ```
 
 ## 许可证

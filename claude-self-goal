@@ -6,18 +6,25 @@
 # line to the session *from inside the session's own Bash tool*, so an agent can
 # set its own goal — including in background / non-tmux sessions.
 #
-# How the line is delivered (auto-selected):
-#   * inside tmux  -> `tmux send-keys` to our own pane        (no root needed)
-#   * otherwise    -> TIOCSTI the line into the session's pts (needs root)
+# How the line is delivered (auto-selected by session type):
+#   * inside tmux             -> `tmux send-keys` to our own pane   (no root)
+#   * interactive pts session -> TIOCSTI the line into its pts      (needs root)
+#   * daemon-managed session  -> `claude attach <id>` over its rv socket
+#     (`/bg` sessions read input from a unix socket, not a pts, so TIOCSTI can't
+#     reach them; the official attach client speaks that protocol for us)
+#   * headless (`claude -p`)  -> refused (no way to deliver interactive input)
 #
-# The pts target is found by walking up the process tree to the Claude Code
-# process we descend from whose stdin/stdout is a pts. Discovery is fail-closed:
-# if no such Claude ancestor is found, the tool refuses to inject.
+# Auto-discovery is fail-closed and classifies ONLY the nearest Claude Code
+# ancestor (never a grandparent session): the pts path requires that pts to be
+# the process's controlling terminal; the daemon path reads the id back from the
+# process's own single listening rv socket. `--session <id>` is an explicit
+# cross-session override that targets another daemon session by id.
 #
-# SECURITY: TIOCSTI is a privileged keystroke-injection primitive the kernel
-# restricts by default. This tool is for automating YOUR OWN Claude Code
-# sessions on a machine you control. See SECURITY.md. Do not run it on shared /
-# multi-user hosts or against sessions you do not own.
+# SECURITY: the tiocsti path uses TIOCSTI, a privileged keystroke-injection
+# primitive the kernel restricts by default; the attach path uses the official
+# client. Either way this is for automating YOUR OWN Claude Code sessions on a
+# machine you control. See SECURITY.md. Do not run it on shared / multi-user
+# hosts or against sessions you do not own.
 #
 # License: MIT.
 import argparse
@@ -25,7 +32,7 @@ import os
 import re
 import sys
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 # exit codes
 EX_OK = 0
@@ -91,6 +98,29 @@ def _fd_target(pid, fd):
         return ""
 
 
+def _controlling_pts(pid):
+    """Return the process's CONTROLLING terminal as /dev/pts/N, or "" if it has
+    none. Reads tty_nr (field 7) from /proc/<pid>/stat; 0 means no controlling
+    tty. This is what separates a live interactive session (whose pts is its
+    controlling terminal) from a daemon-managed background session that merely
+    holds a pts fd but reads its input over a socket."""
+    data = _read("/proc/%d/stat" % pid)
+    if not data:
+        return ""
+    try:
+        rest = data[data.rindex(b")") + 2:].split()
+        tty_nr = int(rest[4])
+    except (ValueError, IndexError):
+        return ""
+    if tty_nr == 0:
+        return ""
+    major = (tty_nr >> 8) & 0xFFF
+    minor = (tty_nr & 0xFF) | ((tty_nr >> 12) & 0xFFF00)
+    if major != 136:  # 136 = UNIX98 pts
+        return ""
+    return "/dev/pts/%d" % minor
+
+
 def is_claude(comm, cmdline):
     """Identify a Claude Code process across install shapes (native `claude.exe`
     binary or node `cli.js`). Kept strict on purpose: the safety model relies on
@@ -102,27 +132,92 @@ def is_claude(comm, cmdline):
 
 
 def find_claude_pts(start_pid=None):
-    """Walk up from start_pid to find the Claude Code ancestor whose stdin AND
-    stdout are the same pts. Returns (pts_path, pid) or (None, None).
+    """Controlling pts of our NEAREST Claude Code ancestor — (pts_path, pid) if
+    that ancestor is a live interactive session on a pts, else (None, None).
 
-    Requiring BOTH fd0 and fd1 to be the same pts distinguishes the interactive
-    TUI process (which reads keystrokes from that pts) from helper processes."""
+    We classify ONLY the nearest Claude ancestor and never reach past it. That
+    matters for a daemon/background session launched from an interactive Claude:
+    the nearest Claude has no controlling tty, and scanning further up would find
+    the *foreground parent* session's pts and inject into the wrong session.
+
+    Requirements for the nearest Claude ancestor:
+      * its stdin and stdout are the same pts;
+      * that pts is its CONTROLLING terminal (rejects daemon `/bg` sessions,
+        which hold a pts fd but read input over a socket)."""
+    cpid = find_claude_ancestor(start_pid)
+    if cpid is None:
+        return None, None
+    fd0 = _fd_target(cpid, 0)
+    fd1 = _fd_target(cpid, 1)
+    if fd0.startswith("/dev/pts/") and fd0 == fd1 and fd0 == _controlling_pts(cpid):
+        return fd0, cpid
+    return None, None
+
+
+def find_claude_ancestor(start_pid=None):
+    """First Claude Code process in our ancestry, or None. Unlike find_claude_pts
+    this does not require a controlling pts — used to locate a daemon-managed
+    session so we can read back its session id."""
     pid = start_pid if start_pid is not None else os.getppid()
     seen = 0
     while pid and pid > 1 and seen < 40:
         seen += 1
-        comm = _proc_comm(pid)
-        cmdline = _proc_cmdline(pid)
-        if is_claude(comm, cmdline):
-            fd0 = _fd_target(pid, 0)
-            fd1 = _fd_target(pid, 1)
-            if fd0.startswith("/dev/pts/") and fd0 == fd1:
-                return fd0, pid
+        if is_claude(_proc_comm(pid), _proc_cmdline(pid)):
+            return pid
         nxt = _proc_ppid(pid)
         if nxt == pid:
             break
         pid = nxt
-    return None, None
+    return None
+
+
+def _rv_session_id(inodes, unix_lines):
+    """Pure: given a set of socket inode strings and /proc/net/unix lines, return
+    the session id of the process's own rendezvous socket. Fail closed: we accept
+    ONLY a LISTENING `.../rv/<id>.sock` the process owns, and only when there is
+    exactly one such id. Zero (headless, or only client rv fds) or more than one
+    (ambiguous) -> None. A connected-but-not-listening rv fd never counts."""
+    ids = set()
+    for line in unix_lines:
+        parts = line.split()
+        if len(parts) < 8:
+            continue
+        flags, inode, path = parts[3], parts[6], parts[7]
+        if inode not in inodes or "/rv/" not in path or not path.endswith(".sock"):
+            continue
+        base = path.rsplit("/", 1)[1][:-len(".sock")]
+        if not re.fullmatch(r"[0-9a-f]{6,}", base):
+            continue
+        try:
+            listening = bool(int(flags, 16) & 0x10000)  # SO_ACCEPTCON
+        except ValueError:
+            listening = False
+        if listening:
+            ids.add(base)
+    return next(iter(ids)) if len(ids) == 1 else None
+
+
+def find_session_id(claude_pid):
+    """Read the daemon session id off the Claude process's own listening
+    rendezvous socket. The process LISTENs on `.../rv/<id>.sock`; we map its
+    socket fds to paths via /proc/net/unix and pull <id> out. Returns the id
+    string or None."""
+    inodes = set()
+    try:
+        fds = os.listdir("/proc/%d/fd" % claude_pid)
+    except OSError:
+        return None
+    for fd in fds:
+        try:
+            t = os.readlink("/proc/%d/fd/%s" % (claude_pid, fd))
+        except OSError:
+            continue
+        m = re.match(r"socket:\[(\d+)\]$", t)
+        if m:
+            inodes.add(m.group(1))
+    if not inodes:
+        return None
+    return _rv_session_id(inodes, _read("/proc/net/unix").decode("utf-8", "replace").splitlines())
 
 
 def tiocsti_inject(pts_path, line):
@@ -157,6 +252,95 @@ def tmux_inject(pane, line):
     subprocess.run(["tmux", "send-keys", "-t", pane, "Enter"], check=True)
 
 
+def attach_inject(session_id, line, connect_wait=6.0, settle=3.0):
+    """Deliver `line` to a daemon-managed session by running `claude attach <id>`
+    in a private pty (the official client speaks the rv-socket protocol), typing
+    the line + Enter, then detaching. The target session keeps running. Returns
+    None on success, or an error string."""
+    import pty
+    import select
+    import shutil
+    import signal
+    import time
+
+    if shutil.which("claude") is None:
+        return "`claude` not found on PATH (needed to attach)"
+    try:
+        pid, master = pty.fork()
+    except OSError as e:
+        return "pty.fork failed: %s" % e
+    if pid == 0:
+        try:
+            os.setsid()  # own session/process group so we can reap the whole tree
+        except OSError:
+            pass
+        os.environ["TERM"] = "xterm-256color"
+        os.execvp("claude", ["claude", "attach", session_id])
+        os._exit(127)
+
+    def child_exit():
+        """Return the child's exit status if it has exited, else None."""
+        try:
+            wpid, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return 0
+        return status if wpid == pid else None
+
+    def drain(seconds):
+        """Read+discard output for up to `seconds`; stop early if the child exits.
+        Returns True if the child is still alive, False if it exited."""
+        end = time.time() + seconds
+        while time.time() < end:
+            if child_exit() is not None:
+                return False
+            r, _, _ = select.select([master], [], [], 0.3)
+            if r:
+                try:
+                    if not os.read(master, 65536):
+                        break
+                except OSError:
+                    break
+        return child_exit() is None
+
+    def detach():
+        try:
+            os.close(master)
+        except OSError:
+            pass
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            if child_exit() is not None:
+                break
+            try:
+                os.killpg(pid, sig)  # pid == pgid because the child called setsid
+            except OSError:
+                try:
+                    os.kill(pid, sig)
+                except OSError:
+                    pass
+            time.sleep(0.3)
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except OSError:
+            pass
+
+    alive = drain(connect_wait)  # let the attach client connect + render
+    if not alive:
+        detach()
+        return "`claude attach %s` exited before we could inject (bad/unknown id?)" % session_id
+    try:
+        for ch in line.encode("utf-8"):
+            os.write(master, bytes([ch]))
+            time.sleep(0.004)
+        time.sleep(0.4)
+        os.write(master, b"\r")
+    except OSError as e:
+        detach()
+        return "writing to attach client failed: %s" % e
+    drain(settle)
+    detach()
+    return None
+
+
 def in_tmux():
     return bool(os.environ.get("TMUX")) and bool(os.environ.get("TMUX_PANE"))
 
@@ -176,8 +360,12 @@ def main(argv=None):
     p.add_argument("condition", nargs="?", help="the goal condition to keep working until it holds")
     p.add_argument("--clear", action="store_true", help="clear the current goal (inject '/goal clear')")
     p.add_argument("--dry-run", action="store_true", help="show the chosen method + target and the exact line, but do not inject")
-    p.add_argument("--method", choices=["auto", "tmux", "tiocsti"], default="auto",
-                   help="delivery method (default: auto — tmux if in tmux, else tiocsti)")
+    p.add_argument("--method", choices=["auto", "tmux", "tiocsti", "attach"], default="auto",
+                   help="delivery method (default: auto — picks tmux / tiocsti / attach "
+                        "by session type)")
+    p.add_argument("--session", metavar="ID",
+                   help="target a specific daemon-managed session by id (implies --method "
+                        "attach; use it to set a goal on another background session)")
     p.add_argument("--unsafe-pts", metavar="/dev/pts/N",
                    help="inject into an explicit pts instead of discovering it (DANGEROUS)")
     p.add_argument("--i-understand-this-can-inject-keystrokes", dest="ack_unsafe",
@@ -185,10 +373,34 @@ def main(argv=None):
     p.add_argument("--version", action="version", version="claude-self-goal " + __version__)
     args = p.parse_args(argv)
 
+    # Safety valve: CLAUDE_SELF_GOAL_DRY_RUN=1 forces dry-run, so nothing is ever
+    # injected. Test suites set this so a buggy test can never fire a real /goal
+    # into the session running the tests.
+    if os.environ.get("CLAUDE_SELF_GOAL_DRY_RUN") == "1":
+        args.dry_run = True
+
     if not args.clear and not args.condition:
         p.error("a goal condition is required (or use --clear)")
     if args.clear and args.condition:
         p.error("--clear takes no condition")
+    if args.session:
+        if not re.fullmatch(r"[0-9a-f-]{6,}", args.session):
+            p.error("--session id must look like a session id (hex, e.g. 994f658d)")
+        if args.method not in ("auto", "attach"):
+            p.error("--session implies --method attach; drop --method or set it to attach")
+    # --unsafe-pts is a tiocsti-only override; validate it here (before any
+    # injection path) and force the tiocsti method, so it can never be
+    # auto-routed to the attach path.
+    if args.unsafe_pts:
+        if args.session:
+            p.error("--unsafe-pts and --session are mutually exclusive")
+        if args.method not in ("auto", "tiocsti"):
+            p.error("--unsafe-pts implies --method tiocsti")
+        if not args.ack_unsafe:
+            p.error("--unsafe-pts requires --i-understand-this-can-inject-keystrokes")
+        if not re.fullmatch(r"/dev/pts/[0-9]+", args.unsafe_pts):
+            p.error("--unsafe-pts must be a /dev/pts/N path")
+        args.method = "tiocsti"
 
     try:
         line = build_line(args)
@@ -196,10 +408,57 @@ def main(argv=None):
         eprint("claude-self-goal: " + str(e))
         return EX_BAD_CONDITION
 
-    # method selection
+    # ---- method selection ----------------------------------------------------
     method = args.method
+    session_id = args.session
     if method == "auto":
-        method = "tmux" if in_tmux() else "tiocsti"
+        if session_id:
+            method = "attach"
+        else:
+            # Classify ONLY the nearest Claude ancestor.
+            pts, _ = find_claude_pts()
+            if pts is not None:
+                # interactive pts session. Prefer tmux only if we're actually in
+                # tmux AND this session's pts is that pane's tty (a /bg session
+                # can inherit TMUX env without being an interactive tmux pane).
+                pane = os.environ.get("TMUX_PANE")
+                if in_tmux() and pane and tmux_pane_tty(pane) == pts:
+                    method = "tmux"
+                else:
+                    method = "tiocsti"
+            else:
+                # No controlling-tty pts on the nearest Claude. If it's a daemon
+                # session we can read its id off its rv socket -> attach. Else
+                # headless (piped stdin) -> refuse.
+                cpid = find_claude_ancestor()
+                sid = find_session_id(cpid) if cpid else None
+                if sid:
+                    method, session_id = "attach", sid
+                else:
+                    eprint("claude-self-goal: no way to deliver a /goal to this session.")
+                    eprint("  The nearest Claude Code ancestor has neither a controlling pts nor")
+                    eprint("  a daemon rv socket. A headless `claude -p` session (piped stdin)")
+                    eprint("  cannot take an interactive /goal. Run this from an interactive")
+                    eprint("  terminal, a tmux session, or a `/bg` session — or pass --session <id>.")
+                    return EX_NO_TARGET
+
+    if method == "attach":
+        if not session_id:
+            cpid = find_claude_ancestor()
+            session_id = find_session_id(cpid) if cpid else None
+            if not session_id:
+                eprint("claude-self-goal: --method attach but no session id found.")
+                eprint("  Could not read this session's id from its rv socket; pass --session <id>.")
+                return EX_NO_TARGET
+        if args.dry_run:
+            print("method=attach session=%s line=%r" % (session_id, line))
+            return EX_OK
+        err = attach_inject(session_id, line)
+        if err:
+            eprint("claude-self-goal: attach injection failed: " + err)
+            return EX_INJECT_FAILED
+        print("claude-self-goal: sent %r to session %s via claude attach" % (line, session_id))
+        return EX_OK
 
     if method == "tmux":
         pane = os.environ.get("TMUX_PANE")
@@ -229,22 +488,18 @@ def main(argv=None):
         print("claude-self-goal: sent %r to tmux pane %s (%s)" % (line, pane, pane_tty))
         return EX_OK
 
-    # tiocsti path
+    # tiocsti path (args.unsafe_pts already validated up-front)
     if args.unsafe_pts:
-        if not args.ack_unsafe:
-            eprint("claude-self-goal: --unsafe-pts requires --i-understand-this-can-inject-keystrokes")
-            return EX_USAGE
         pts = args.unsafe_pts
-        if not re.fullmatch(r"/dev/pts/[0-9]+", pts):
-            eprint("claude-self-goal: --unsafe-pts must be a /dev/pts/N path")
-            return EX_USAGE
     else:
         pts, _ = find_claude_pts()
         if pts is None:
-            eprint("claude-self-goal: no Claude Code session pts found in this process's ancestry.")
-            eprint("  This session may be headless (piped stdin / `claude -p`), which cannot")
-            eprint("  receive a /goal. Run this from inside an interactive or background session,")
-            eprint("  or pass --unsafe-pts explicitly if you know what you are doing.")
+            eprint("claude-self-goal: no live interactive Claude Code pts found in this ancestry.")
+            eprint("  The session either is headless (piped stdin / `claude -p`), or is a")
+            eprint("  daemon-managed background session (`/bg`) whose input arrives over a")
+            eprint("  socket rather than a controlling terminal. In both cases there is no pts")
+            eprint("  to inject a /goal into. Run this from an interactive terminal or a tmux")
+            eprint("  session, or pass --unsafe-pts explicitly if you truly know the target.")
             return EX_NO_TARGET
 
     if args.dry_run:

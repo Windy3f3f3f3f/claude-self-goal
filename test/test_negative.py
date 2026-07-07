@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""CLI-level negative tests. Every case here is rejected BEFORE any injection
-could happen, and the few that reach the real path use --dry-run, so running
-this from inside a live Claude session never injects anything."""
+"""CLI-level negative tests. Belt-and-suspenders safety: every invocation runs
+with CLAUDE_SELF_GOAL_DRY_RUN=1, so even a buggy case can never fire a real
+/goal into the session running the tests. (The cases here are also designed to
+fail at argparse or to use --dry-run, but the env guard is the hard backstop.)"""
 import os
 import subprocess
 import sys
@@ -10,11 +11,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _util import TOOL  # noqa: E402
 
 fails = []
+SAFE_ENV = dict(os.environ, CLAUDE_SELF_GOAL_DRY_RUN="1")
 
 
 def run(args):
     return subprocess.run([sys.executable, TOOL] + args,
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, env=SAFE_ENV)
 
 
 def check(name, cond, got=None):
@@ -49,6 +51,20 @@ check("unsafe-pts trailing newline rejected", r.returncode == 2, r.returncode)
 # --clear with a condition -> usage error
 r = run(["--clear", "a stray condition"])
 check("clear + condition rejected", r.returncode == 2, r.returncode)
+
+# --session with a non-id-looking value -> usage error
+r = run(["--session", "not an id!", "g"])
+check("bad --session id rejected", r.returncode == 2, r.returncode)
+
+# --session together with an incompatible --method -> usage error
+r = run(["--session", "994f658d", "--method", "tmux", "g"])
+check("--session + --method tmux rejected", r.returncode == 2, r.returncode)
+
+# --session dry-run reports the attach plan deterministically (no discovery, no inject)
+r = run(["--session", "994f658d", "--dry-run", "a goal"])
+check("--session dry-run exits 0", r.returncode == 0, r.returncode)
+check("--session dry-run prints attach plan",
+      "method=attach" in r.stdout and "994f658d" in r.stdout, r.stdout)
 
 # dry-run never injects and reports a plan (exit 0). Use --unsafe-pts to bypass
 # discovery so this is deterministic regardless of where the suite runs.
