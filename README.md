@@ -1,94 +1,90 @@
 # claude-self-goal
 
-Let a running **Claude Code** session set its own native `/goal` — from inside the session's own Bash tool, with no human typing, no tmux pane required, and no `claude -p`.
+简体中文 · [English](./README.en.md)
 
-> `/goal <condition>` is a built-in Claude Code command (v2.1.139+): the session keeps working across turns until an independent evaluator judges the condition met. Normally only a human can type it. `claude-self-goal` delivers that same line to the session programmatically, so an autonomous agent can give *itself* a goal.
+让正在运行的 Claude Code 会话给自己设一个原生 `/goal`——不用人敲、不需要 tmux、也不走 `claude -p`,后台会话同样能用。
 
-Verified on Claude Code **v2.1.202**, Linux, as root.
+> Claude Code 的 `/goal <条件>`(v2.1.139 起)会让会话一直干到某个条件满足才停,中途每次想收工都由一个独立的判定器检查条件到了没有。这条命令平时只能人手动敲；claude-self-goal 把同样一行字从程序里送进会话，于是一个自主 agent 能给自己定目标。
 
-## The problem
+在 Claude Code v2.1.202、Linux、root 下验证通过。
 
-There is no official way to set the native `/goal` programmatically — no hook field, no `settings.json` key, no environment variable, no CLI flag, no API. Hooks explicitly cannot trigger slash commands, and `claude -p "/goal ..."` deadlocks (v2.1.202). The only way to fire the *native* goal machinery is to deliver the text `/goal <condition>` to the session's input, exactly as if a human typed it.
+## 它解决什么问题
 
-If your session runs inside **tmux**, you can already do that with `tmux send-keys`. The hard case is a **background / non-tmux** session that has no pane to type into. `claude-self-goal` handles both.
+设置原生 `/goal` 没有任何程序化入口——没有 hook 字段，没有 `settings.json` 选项，没有环境变量，没有命令行参数，也没有 API。hook 被明确设计成不能触发 slash 命令，而 `claude -p "/goal ..."` 在 v2.1.202 上会卡死。要让原生的 goal 机制真正转起来，唯一的办法是把 `/goal <条件>` 这行文字送进会话的输入，跟人手敲进去一模一样。
 
-## What it does
+如果会话跑在 tmux 里，这件事 `tmux send-keys` 就能做。难的是后台、不在 tmux 的会话——它根本没有一个窗格可以打字。claude-self-goal 把这两种情况都接上了。
 
-1. Finds the Claude Code process you descend from whose stdin **and** stdout are the same pts (its interactive input terminal). Discovery is **fail-closed**: if no such Claude ancestor is found, it refuses to inject.
-2. Delivers `/goal <condition>` to it, auto-selecting the method:
-   - **inside tmux** → `tmux send-keys` to your pane (no root needed — preferred);
-   - **otherwise** → `TIOCSTI` the line into the session's pts (needs root).
+## 它怎么工作
 
-The session receives it as ordinary input, so the real `/goal` engages: the `◎ /goal active` chip, the independent completion evaluator, and keep-working-until-met. If you set the goal mid-turn, it queues and applies at the turn boundary.
+分两步。先顺着进程树往上找，定位到你所在的那个 Claude Code 进程，条件是它的标准输入和标准输出指向同一个 pts。这一步是“失败即停”的：找不到这样的 Claude 祖先进程，就直接拒绝，绝不会随便挑一个终端往里塞。找到之后，按环境自动选投递方式——在 tmux 里就用 `tmux send-keys` 发到你的窗格，不需要 root；不在 tmux 就用 `TIOCSTI` 把这行字塞进那个 pts，这条需要 root。
 
-## Quickstart
+会话把它当成普通输入收下，于是真正的 `/goal` 生效：右下角的 `◎ /goal active` 计时标、独立的完成判定、以及不到目标不收工。要是你在会话正忙的时候设的，它会先排队，等当前这一轮结束再落地。
+
+## 快速上手
 
 ```bash
-# from inside a Claude Code session's Bash tool (or a skill):
-claude-self-goal "all tests pass and the build is green"
+# 在 Claude Code 会话的 Bash 工具里（或一个 skill 里）：
+claude-self-goal "所有测试通过，并且构建是绿的"
 
-# clear it early:
+# 计划变了，提前清掉：
 claude-self-goal --clear
 
-# see what would happen without injecting:
-claude-self-goal --dry-run "the migration is complete"
+# 只想看看它会做什么，先不真的注入：
+claude-self-goal --dry-run "迁移已经完成"
 ```
 
-## Install
+## 安装
 
 ```bash
 git clone https://github.com/Windy3f3f3f3f/claude-self-goal.git
 cd claude-self-goal
-# put it on PATH (symlink keeps it updatable):
+# 放进 PATH（用软链接，方便以后更新）：
 sudo ln -s "$PWD/claude-self-goal" /usr/local/bin/claude-self-goal
 ```
 
-Requires Python 3.6+ and Linux. The tmux path needs `tmux`; the non-tmux path needs root (see Security).
+需要 Python 3.6 以上和 Linux。tmux 那条路需要装 `tmux`；非 tmux 那条路需要 root（见“安全”一节）。
 
-## Use as a Claude Code skill
+## 当成 Claude Code skill 用
 
-Copy `skill/SKILL.md` into `~/.claude/skills/self-goal/SKILL.md` (adjust the path to the executable). The skill lets the model call the tool in one step to give itself a goal. See [`skill/SKILL.md`](skill/SKILL.md).
+把 `skill/SKILL.md` 拷到 `~/.claude/skills/self-goal/SKILL.md`（把里面的可执行文件路径改成你的）。装好之后，模型一步就能调用它给自己设目标。细节见 [`skill/SKILL.md`](skill/SKILL.md)。
 
-## Usage
+## 用法
 
-| Command | Effect |
+| 命令 | 作用 |
 |---|---|
-| `claude-self-goal "<condition>"` | set a native `/goal` on the current session |
-| `claude-self-goal --clear` | clear the current goal (`/goal clear`) |
-| `claude-self-goal --dry-run "<condition>"` | show the chosen method + target, inject nothing |
-| `claude-self-goal --method tmux\|tiocsti\|auto` | force a delivery method (default `auto`) |
-| `claude-self-goal --unsafe-pts /dev/pts/N ... --i-understand-this-can-inject-keystrokes` | inject into an explicit pts (dangerous; discovery bypassed) |
+| `claude-self-goal "<条件>"` | 给当前会话设一个原生 `/goal` |
+| `claude-self-goal --clear` | 清掉当前 goal（`/goal clear`） |
+| `claude-self-goal --dry-run "<条件>"` | 只打印选中的方式和目标，什么都不注入 |
+| `claude-self-goal --method tmux\|tiocsti\|auto` | 强制投递方式（默认 `auto`） |
+| `claude-self-goal --unsafe-pts /dev/pts/N ... --i-understand-this-can-inject-keystrokes` | 注入到指定的 pts（危险，跳过自动发现） |
 
-Exit codes: `0` ok · `2` usage · `3` no Claude target found · `4` not root (tiocsti) · `5` injection failed · `6` bad condition (control characters).
+退出码：`0` 成功，`2` 用法错误，`3` 没找到 Claude 目标，`4` 非 root（tiocsti 路），`5` 注入失败，`6` 条件里有控制字符。
 
-The goal condition is sanitized: any control character (CR, LF, ESC, …) is rejected, so the text cannot smuggle a second command into the session.
+goal 条件会先过一道净化：任何控制字符（回车、换行、ESC 等）都会被拒，所以这行文字没法夹带第二条命令进会话。
 
-## Requirements & limitations
+## 需要什么、有哪些限制
 
-- **Linux only.** Uses `/proc` for discovery and the Linux `TIOCSTI` ioctl.
-- **The non-tmux path needs root** (or `CAP_SYS_ADMIN`). The tmux path does not.
-- **Won't work on a headless `claude -p` session** whose stdin is a pipe or `/dev/null` — there is no pts to inject into. Such sessions can't run interactive `/goal` anyway.
-- **Version-coupled.** It depends on Claude Code's current input handling (verified on v2.1.202). A future UI/input change could break it.
+只支持 Linux——自动发现靠 `/proc`，注入靠 Linux 的 `TIOCSTI`。非 tmux 那条路需要 root（或 `CAP_SYS_ADMIN`），tmux 那条不用。对着一个 headless 的 `claude -p` 会话不管用：它的标准输入是管道或 `/dev/null`，没有 pts 可以注入，而这种会话本来也跑不了交互式 `/goal`。它还跟 Claude Code 当前的输入处理绑得比较紧（在 v2.1.202 上验证过），将来界面或输入链路一变，可能就失效。
 
-## Security
+## 安全
 
-This tool uses `TIOCSTI`, a privileged keystroke-injection primitive that the kernel restricts by default. It is designed for automating **your own** Claude Code sessions on a machine you control. It is **not** for shared / multi-user hosts and **not** for sessions you do not own. Please read [`SECURITY.md`](SECURITY.md) before using it.
+这工具用到 `TIOCSTI`——一个内核默认收紧的“模拟键盘输入”特权操作。它是给你在自己控制的机器上、自动化你自己的 Claude Code 会话用的，不适合多用户或共享主机，也别拿去碰不属于你的会话。用之前请先读 [`SECURITY.md`](SECURITY.md)。
 
-## How it works
+## 深入原理
 
-The mechanism, the topology of interactive vs. background sessions, and why every non-injection approach fails are written up in [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md).
+交互式会话和后台会话在终端上的拓扑差别、为什么每一种“非注入”的办法都走不通、这套机制到底怎么成立，都写在 [`docs/HOW-IT-WORKS.md`](docs/HOW-IT-WORKS.md)。
 
-## Roadmap
+## 以后想做的
 
-- A rootless option for *newly launched* sessions: start the session under a small pty-proxy / Unix-socket wrapper that writes the pty master directly, avoiding `TIOCSTI` entirely. This would not cover already-running sessions (that's what v1 is for) but is safer and more portable.
+给“新启动”的会话提供一条不需要 root 的路子：会话起来的时候就套一个小小的 pty 代理或 Unix socket wrapper，直接写 pty 的 master 端，从而绕开 `TIOCSTI`。这条覆盖不了已经在跑的会话（那正是现在这个版本管的事），但更安全、也更好移植。
 
-## Testing
+## 测试
 
 ```bash
-./run-tests.sh                       # discovery + negative (+ primitive if root)
-RUN_CLAUDE_INTEGRATION=1 ./run-tests.sh   # also the full end-to-end test (needs claude + root + quota)
+./run-tests.sh                            # 发现 + 负例（是 root 的话再加 primitive）
+RUN_CLAUDE_INTEGRATION=1 ./run-tests.sh   # 再跑完整的端到端测试（需要 claude + root + 额度）
 ```
 
-## License
+## 许可证
 
-MIT — see [`LICENSE`](LICENSE).
+MIT，见 [`LICENSE`](LICENSE)。

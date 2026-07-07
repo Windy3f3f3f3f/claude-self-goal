@@ -1,31 +1,37 @@
-# Security & threat model
+# 安全与威胁模型
 
-`claude-self-goal` injects input into a running Claude Code session. Please understand what that means before you use it.
+简体中文 · [English](./SECURITY.en.md)
 
-## What this is
+claude-self-goal 会往一个正在运行的 Claude Code 会话里注入输入。用它之前，先弄清楚这意味着什么。
 
-A local automation wrapper. It delivers the text `/goal <condition>` to a Claude Code session you are already running, either through `tmux send-keys` (when in tmux) or through the Linux `TIOCSTI` ioctl (otherwise). Its intended use is letting an autonomous agent set a goal on **its own** session on a machine **you control**.
+## 它是什么
 
-## What this is not
+一个本地自动化 wrapper。它把 `/goal <条件>` 这行字送进你已经在跑的 Claude Code 会话，在 tmux 里走 `tmux send-keys`，不在 tmux 就走 Linux 的 `TIOCSTI`。它的用途是让一个自主 agent 在你控制的机器上，给它自己的会话设目标。
 
-It is **not** an exploit of a Claude Code bug or a kernel vulnerability — it uses documented, intended interfaces. But it **is** a privileged keystroke-injection wrapper, and that capability is inherently dual-use:
+## 它不是什么
 
-- `TIOCSTI` pushes bytes into a terminal's input queue *as if typed*. With `CAP_SYS_ADMIN` (root), and unless the kernel/container policy blocks it, a process can do this to **any** pts on the host it can open — not just its own. The same primitive has historically been used to escape restricted shells and inject commands into other users' terminals.
-- This tool deliberately constrains itself to the Claude session in its own process ancestry (fail-closed discovery). That is a **usage** safeguard, not a kernel-enforced boundary. Root can always bypass it (that's what `--unsafe-pts` makes explicit).
+它不是在利用 Claude Code 的 bug，也不是在钻内核漏洞——用的都是有文档、有意提供的接口。但它确实是一个带特权的键盘注入 wrapper，而这种能力天生就是双刃的。`TIOCSTI` 会把字节塞进某个终端的输入队列，效果等同于有人在那儿打字。有了 root（`CAP_SYS_ADMIN`），只要内核和容器策略不拦，一个进程能对它能打开的任意 pts 这么做，不限于自己那个。历史上同一个原语就被用来逃出受限 shell、往别人的终端里塞命令。
 
-## Rules
+这个工具刻意把自己限制在“进程祖先链上那个 Claude 会话”，找不到就拒绝。但要清楚：这是使用层面的自我约束，不是内核强制的边界，root 随时能绕过去——`--unsafe-pts` 就是把这一点摆到明面上。
 
-- **Do not run this on a shared or multi-user host.** On such a machine, a root-capable keystroke injector is a privilege-escalation and session-hijacking tool regardless of this wrapper's own restraint.
-- **Do not target a session you do not own.** Discovery only ever targets a Claude process you descend from; do not defeat that with `--unsafe-pts` against someone else's terminal.
-- **Do not enable `dev.tty.legacy_tiocsti=1`.** Modern kernels disable the legacy `TIOCSTI` path on purpose. This tool works via `CAP_SYS_ADMIN` (root) *without* re-enabling it; we do not document or recommend turning it back on, because that would expose the injection primitive to unprivileged processes.
+## 几条规矩
 
-## Hardening in this tool
+别在多用户或共享主机上跑它。在那种机器上，一个能拿 root 的键盘注入器就是提权和会话劫持工具，这个 wrapper 自己再克制也没用。
 
-- **Fail-closed discovery.** If no Claude Code ancestor with a pts is found, it refuses — no "inject into whatever tty is nearby" fallback.
-- **Both fd0 and fd1 must be the same pts.** This targets the interactive TUI process, not an unrelated helper that merely has a pts on one descriptor.
-- **Condition sanitization.** Any control character (CR/LF/ESC/…) in the goal text is rejected, so the injected line cannot smuggle a second keystroke or slash command.
-- **Explicit, self-documenting escape hatch.** Overriding discovery requires both `--unsafe-pts` and `--i-understand-this-can-inject-keystrokes`.
+别去碰不属于你的会话。自动发现只会指向你派生自的那个 Claude 进程；不要用 `--unsafe-pts` 去打别人的终端把这层保护绕掉。
 
-## Reporting
+别去开 `dev.tty.legacy_tiocsti=1`。现代内核把老式的 `TIOCSTI` 关掉是有意为之。这个工具靠 `CAP_SYS_ADMIN`（root）在不重新打开它的前提下工作；我们不写、也不建议把它开回来，因为那等于把注入原语暴露给没有特权的进程。
 
-Found a way this tool can be misused beyond its stated model, or a bug in the safeguards? Please open an issue. There is no separate embargoed channel — this is a small single-purpose tool.
+## 这个工具做了哪些加固
+
+自动发现是“失败即停”的：找不到带 pts 的 Claude 祖先进程，就拒绝，没有“那就往最近的终端里塞”这种兜底。
+
+标准输入和标准输出必须是同一个 pts：这样锁定的是那个交互式 TUI 进程，而不是某个碰巧有一端是 pts 的辅助进程。
+
+条件会被净化：goal 文字里任何控制字符（回车、换行、ESC 等）都会被拒，注入的这行没法夹带第二次按键或第二条 slash 命令。
+
+越权的口子既显式又自证：想绕过自动发现，得同时给 `--unsafe-pts` 和 `--i-understand-this-can-inject-keystrokes`。
+
+## 反馈
+
+发现这工具能被用到它声明的模型之外，或者哪条保护有 bug？欢迎开 issue。这是个小而专的工具，没有单独的保密上报渠道。

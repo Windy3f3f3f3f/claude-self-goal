@@ -1,57 +1,49 @@
-# How it works
+# 它到底怎么工作
 
-## The goal
+简体中文 · [English](./HOW-IT-WORKS.en.md)
 
-Claude Code's `/goal <condition>` (v2.1.139+) records a completion condition. Whenever the session tries to end a turn, an **independent evaluator** checks whether the condition holds; if not, it sends the model back to keep working, until the condition is met. A `◎ /goal active` chip shows it's engaged. The goal lives in the session's own transcript, so it is naturally per-session — one session's goal never leaks into another.
+## 目标是什么
 
-We want an autonomous session to set this on **itself**, with no human typing.
+Claude Code 的 `/goal <条件>`(v2.1.139 起)记下一个完成条件。此后每当会话想结束一轮、停下来，一个独立的判定器会检查条件到了没有；没到，就把模型打回去继续干，直到满足为止。右下角的 `◎ /goal active` 标示它正生效。goal 存在会话自己的 transcript 里，所以天生按会话隔离——一个会话的 goal 不会漏进另一个。
 
-## Why you can't just "call" it
+我们想让一个自主会话给自己设上这个，全程不用人打字。
 
-There is no programmatic entry point to the native goal:
+## 为什么不能直接“调用”它
 
-- **Hooks can't.** Every hook input/output field is documented as *not* interpreted as slash commands. A `Stop` hook can *emulate* a goal loop (block stopping until your own check passes), but that reimplements the feature — you lose the built-in evaluator and the UI, and you have to solve per-session isolation yourself.
-- **No settings / env / CLI / API** sets the goal.
-- **`claude -p "/goal ..."` deadlocks** on v2.1.202 (hangs with no output), even with a real task attached.
+原生 goal 没有任何程序化入口。hook 不行——它的每个输入输出字段都写明了不会被当作 slash 命令解析。一个 `Stop` hook 可以模仿出一个目标循环(不满足就拦着不让停)，但那是在重造这个功能，你会丢掉内置的判定器和那套 UI，还得自己解决按会话隔离的问题。settings、环境变量、命令行、API 也都设不了它。而 `claude -p "/goal ..."` 在 v2.1.202 上会卡死，哪怕后面接了真任务也一样，挂在那里不出声。
 
-So the only way to engage the *native* machinery is to put the text `/goal <condition>` into the session's **input**, exactly as a human would.
+所以，要让原生的机制真正转起来，唯一的办法是把 `/goal <条件>` 这行文字送进会话的输入，跟人手敲进去没有区别。
 
-## How input reaches a running session
+## 输入是怎么进到一个正在运行的会话的
 
-A `claude` process reads user input from a **pts** (pseudo-terminal slave):
+一个 `claude` 进程从一个 pts(伪终端的 slave 端)读用户输入。
 
-- **Interactive session in a terminal** — the pts is its controlling terminal. Both stdin and stdout point at it.
-- **Background / supervised session** — a supervisor (Claude Code's own pty-host) allocates a pty pair per session, holds the master, and the session reads the slave. On the machine this was built on, a backgrounded session's `claude` process had `stdin = stdout = /dev/pts/0`, with a separate `--bg-pty-host` process holding the master.
+交互式会话跑在终端里时，这个 pts 就是它的控制终端，标准输入和标准输出都指向它。后台或被托管的会话不一样：有一个 supervisor(Claude Code 自己的 pty-host)给每个会话分一对 pty，自己攥着 master 端，会话读 slave 端。在做出这个工具的机器上，一个后台会话的 `claude` 进程标准输入和标准输出都是 `/dev/pts/0`，另有一个 `--bg-pty-host` 进程持着 master。
 
-Either way, the session reads a pts. Anything that lands in that pts's input queue is read as if typed.
+两种情况都一样：会话读的是一个 pts。任何落进这个 pts 输入队列的东西，都会被当成有人在打字读走。
 
-### tmux is one way to write that input
+### tmux 是往里写输入的一种办法
 
-If the session runs inside tmux, `tmux send-keys -t <pane>` writes into the pane's pty — the clean, unprivileged path. But it requires the session to have been started in tmux, and you can't retrofit tmux around an already-running process.
+会话跑在 tmux 里的话，`tmux send-keys -t <窗格>` 就能写进那个窗格的 pty，这是干净、不需要特权的路子。但它要求会话一开始就是在 tmux 里起的，而你没法给一个已经在跑的进程事后套上 tmux。
 
-### TIOCSTI is the no-tmux way
+### TIOCSTI 是不靠 tmux 的办法
 
-`TIOCSTI` ("terminal I/O control: simulate terminal input") is an ioctl that pushes a byte into a tty's input queue as if typed. With `CAP_SYS_ADMIN` (root) you can do this to a pts by opening it by path — no tmux, no master handle. This is what makes **background / non-tmux** self-set possible.
+`TIOCSTI`(terminal I/O control: simulate terminal input)是一个 ioctl，把一个字节塞进某个 tty 的输入队列，效果等同于有人敲了它。有了 `CAP_SYS_ADMIN`(root)，你可以按路径打开一个 pts 直接对它这么做——不用 tmux，也不用 master 端的句柄。这正是让后台、非 tmux 会话也能自设目标的关键。
 
-Whether it works depends on the environment, not just privilege. Modern kernels disable the *legacy* unprivileged `TIOCSTI` (`dev.tty.legacy_tiocsti=0`, often compiled out entirely) precisely because it's a keystroke-injection primitive; a `CAP_SYS_ADMIN` process can still use it, but a seccomp filter, user namespace, or container policy can block it even for root. The tool reports an accurate diagnostic when the ioctl is refused. See [SECURITY.md](../SECURITY.md).
+能不能用，取决于环境，而不只是特权。现代内核会把老式的、不需特权的 `TIOCSTI` 关掉(`dev.tty.legacy_tiocsti=0`，往往整个编译掉)，正因为它是个键盘注入原语；一个 `CAP_SYS_ADMIN` 进程仍然能用，但一层 seccomp 过滤、user namespace 或容器策略，可以连 root 都拦下来。ioctl 被拒时，工具会给出对应的准确诊断。详见 [SECURITY.md](../SECURITY.md)。
 
-## Finding the right pts (fail-closed)
+## 怎么找对那个 pts(失败即停)
 
-Injecting into the *wrong* tty would be bad, so discovery is strict:
+塞错终端会很糟，所以发现这一步很严。它先从工具自己的父进程往上爬进程树，找一个 Claude Code 祖先进程——靠 `comm` 和 `/proc/<pid>/cmdline` 一起认，既覆盖原生的 `claude.exe` 二进制，也覆盖 node 的 `cli.js` 装法。然后要求这个祖先的标准输入和标准输出是同一个 `/dev/pts/N`——这一条把交互式 TUI 进程(它在那儿读按键)和别的辅助进程区分开。第一个同时满足这些的祖先就是目标。一个都满足不了，就拒绝，没有“退而求其次找个最近的 tty”这种兜底。
 
-1. Walk up the process tree from the tool's own parent.
-2. Identify a **Claude Code** ancestor (by `comm` and by `/proc/<pid>/cmdline`, covering both the native `claude.exe` binary and node `cli.js` installs).
-3. Require that ancestor's **stdin and stdout to be the same `/dev/pts/N`** — that distinguishes the interactive TUI process (which reads keystrokes there) from helper processes.
-4. The first ancestor that satisfies all of this is the target. If none does, **refuse** — there is no "nearest tty" fallback.
+正因为只会指向一个“我派生自的 Claude 进程”所拥有的 pts，“给自己设”才真的是给自己。
 
-Because we only ever target a pts belonging to a Claude process we descend from, "self-set" stays literally self.
+## 把这行字送进去
 
-## Delivering the line
+注入的是 `"/goal " + 条件 + "\r"`，末尾那个回车负责提交。条件在这之前先被净化：任何控制字符都会被拒，所以它没法夹带第二个 `\r` 去提交一条后面跟着的、由攻击者指定的命令。
 
-We inject `"/goal " + condition + "\r"` — the trailing carriage return submits it. The condition is sanitized first: any control character is rejected, so it can't contain a second `\r` that would submit a following, attacker-chosen command.
+如果是在会话正忙时注入(会话正跑着那条做注入的 Bash 命令)，这行字会在输入里排队，等下一个 turn 边界再落地——goal 随即生效，开始驱动后续工作。
 
-If injected mid-turn (the session is busy running the very Bash call that injects), the line queues in the input and is applied at the next turn boundary — the goal then engages and drives the work.
+## 怎么端到端验证的
 
-## Verifying it end to end
-
-The test harness (`test/test_integration.py`) starts a real, non-tmux `claude` on a private pty, then — via an ordinary user prompt — asks it to run `claude-self-goal` on itself. Success is measured by a side effect: the native goal must drive the session to create a proof file. Nothing is injected by the harness; the child injects into its own pts. This is the exact flow that was proven during development.
+测试 harness(`test/test_integration.py`)在一个私有 pty 上起一个真的、非 tmux 的 `claude`，再通过一条普通的用户提示，让它对自己跑 `claude-self-goal`。成败用一个副作用来判定：原生 goal 必须驱动会话建出一个证明文件。整个过程 harness 自己不注入任何东西，是那个子会话往它自己的 pts 里注入。开发时验证走的就是这条路。
