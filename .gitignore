@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.humanize/
+/tmp/
+*.tmp
+.DS_Store
