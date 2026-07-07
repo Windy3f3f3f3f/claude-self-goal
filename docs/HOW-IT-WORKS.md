@@ -29,11 +29,11 @@ Either way, the session reads a pts. Anything that lands in that pts's input que
 
 If the session runs inside tmux, `tmux send-keys -t <pane>` writes into the pane's pty — the clean, unprivileged path. But it requires the session to have been started in tmux, and you can't retrofit tmux around an already-running process.
 
-### TIOCSTI is the universal way
+### TIOCSTI is the no-tmux way
 
-`TIOCSTI` ("terminal I/O control: simulate terminal input") is an ioctl that pushes a byte into a tty's input queue as if typed. As root / `CAP_SYS_ADMIN` you can do this to a pts by opening it by path — no tmux, no master handle. This is what makes **background / non-tmux** self-set possible.
+`TIOCSTI` ("terminal I/O control: simulate terminal input") is an ioctl that pushes a byte into a tty's input queue as if typed. With `CAP_SYS_ADMIN` (root) you can do this to a pts by opening it by path — no tmux, no master handle. This is what makes **background / non-tmux** self-set possible.
 
-Modern kernels disable the *legacy* unprivileged `TIOCSTI` (`dev.tty.legacy_tiocsti=0`, often compiled out), precisely because it's a keystroke-injection primitive. Root still has it via `CAP_SYS_ADMIN`. See [SECURITY.md](../SECURITY.md).
+Whether it works depends on the environment, not just privilege. Modern kernels disable the *legacy* unprivileged `TIOCSTI` (`dev.tty.legacy_tiocsti=0`, often compiled out entirely) precisely because it's a keystroke-injection primitive; a `CAP_SYS_ADMIN` process can still use it, but a seccomp filter, user namespace, or container policy can block it even for root. The tool reports an accurate diagnostic when the ioctl is refused. See [SECURITY.md](../SECURITY.md).
 
 ## Finding the right pts (fail-closed)
 

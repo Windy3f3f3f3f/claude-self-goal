@@ -42,13 +42,20 @@ check("unsafe-pts without ack rejected", r.returncode == 2, r.returncode)
 r = run(["--unsafe-pts", "/tmp/x", "--i-understand-this-can-inject-keystrokes", "g"])
 check("unsafe-pts non-pts path rejected", r.returncode == 2, r.returncode)
 
-# dry-run never injects and reports a plan (exit 0) — forced tiocsti
-r = run(["--dry-run", "--method", "tiocsti", "a goal condition"])
-check("dry-run tiocsti exits 0", r.returncode == 0, r.returncode)
-check("dry-run prints method+line", "method=" in r.stdout and "line=" in r.stdout, r.stdout)
+# --clear with a condition -> usage error
+r = run(["--clear", "a stray condition"])
+check("clear + condition rejected", r.returncode == 2, r.returncode)
+
+# dry-run never injects and reports a plan (exit 0). Use --unsafe-pts to bypass
+# discovery so this is deterministic regardless of where the suite runs.
+UNSAFE = ["--unsafe-pts", "/dev/pts/999", "--i-understand-this-can-inject-keystrokes"]
+r = run(["--dry-run"] + UNSAFE + ["a goal condition"])
+check("dry-run exits 0", r.returncode == 0, r.returncode)
+check("dry-run prints method+pts+line",
+      "method=tiocsti" in r.stdout and "/dev/pts/999" in r.stdout and "line=" in r.stdout, r.stdout)
 
 # --clear dry-run
-r = run(["--clear", "--dry-run", "--method", "tiocsti"])
+r = run(["--clear", "--dry-run"] + UNSAFE)
 check("clear dry-run exits 0", r.returncode == 0, r.returncode)
 check("clear dry-run line is /goal clear", "/goal clear" in r.stdout, r.stdout)
 

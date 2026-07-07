@@ -76,6 +76,16 @@ while time.time() - t0 < 75:
         ready = True
         break
 
+if not ready:
+    try:
+        os.write(master, b"\x03")
+        os.close(master)
+    except OSError:
+        pass
+    shutil.rmtree(workdir, ignore_errors=True)
+    print("FAIL integration: claude did not reach a ready prompt within 75s")
+    sys.exit(1)
+
 prompt = ("Run exactly this with your Bash tool: %s 'a file named PROOF.txt exists in this directory'. "
           "It sets you a goal; then do what the goal needs." % TOOL)
 for ch in prompt:

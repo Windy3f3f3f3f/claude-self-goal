@@ -22,6 +22,7 @@
 # License: MIT.
 import argparse
 import os
+import re
 import sys
 
 __version__ = "0.1.0"
@@ -92,12 +93,12 @@ def _fd_target(pid, fd):
 
 def is_claude(comm, cmdline):
     """Identify a Claude Code process across install shapes (native `claude.exe`
-    binary or node `cli.js`)."""
-    c = comm.lower()
-    if c in ("claude", "claude.exe") or c.startswith("claude"):
+    binary or node `cli.js`). Kept strict on purpose: the safety model relies on
+    only ever targeting a real Claude Code ancestor."""
+    if comm.strip().lower() in ("claude", "claude.exe"):
         return True
-    cl = cmdline.lower()
-    return ("claude-code" in cl) or ("/claude.exe" in cl) or ("anthropic-ai/claude-code" in cl)
+    # node install: argv contains the package path
+    return "@anthropic-ai/claude-code/" in cmdline.lower()
 
 
 def find_claude_pts(start_pid=None):
@@ -134,6 +135,18 @@ def tiocsti_inject(pts_path, line):
             fcntl.ioctl(fd, termios.TIOCSTI, bytes([ch]))
     finally:
         os.close(fd)
+
+
+def tmux_pane_tty(pane):
+    import subprocess
+
+    try:
+        out = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane, "#{pane_tty}"],
+            capture_output=True, text=True, check=True)
+        return out.stdout.strip()
+    except Exception:
+        return ""
 
 
 def tmux_inject(pane, line):
@@ -174,6 +187,8 @@ def main(argv=None):
 
     if not args.clear and not args.condition:
         p.error("a goal condition is required (or use --clear)")
+    if args.clear and args.condition:
+        p.error("--clear takes no condition")
 
     try:
         line = build_line(args)
@@ -191,20 +206,27 @@ def main(argv=None):
         if not pane:
             eprint("claude-self-goal: --method tmux but not inside tmux (TMUX_PANE unset)")
             return EX_NO_TARGET
-        # sanity: still confirm we descend from a Claude process
-        _, cpid = find_claude_pts()
-        if cpid is None and not args.dry_run:
-            eprint("claude-self-goal: refusing — no Claude Code ancestor found for this tmux pane")
+        # fail-closed: the pane we send to must be the tty of the Claude Code
+        # process we descend from. This defends against a stale/forged TMUX_PANE
+        # pointing at some other pane.
+        pts, cpid = find_claude_pts()
+        if pts is None:
+            eprint("claude-self-goal: refusing — no Claude Code ancestor with a pts found")
+            return EX_NO_TARGET
+        pane_tty = tmux_pane_tty(pane)
+        if pane_tty != pts:
+            eprint("claude-self-goal: refusing — tmux pane %s (tty %s) is not this Claude "
+                   "session's terminal (%s)" % (pane, pane_tty or "?", pts))
             return EX_NO_TARGET
         if args.dry_run:
-            print("method=tmux pane=%s line=%r" % (pane, line))
+            print("method=tmux pane=%s tty=%s line=%r" % (pane, pane_tty, line))
             return EX_OK
         try:
             tmux_inject(pane, line)
         except Exception as e:
             eprint("claude-self-goal: tmux send-keys failed: " + str(e))
             return EX_INJECT_FAILED
-        print("claude-self-goal: sent %r to tmux pane %s" % (line, pane))
+        print("claude-self-goal: sent %r to tmux pane %s (%s)" % (line, pane, pane_tty))
         return EX_OK
 
     # tiocsti path
@@ -213,7 +235,7 @@ def main(argv=None):
             eprint("claude-self-goal: --unsafe-pts requires --i-understand-this-can-inject-keystrokes")
             return EX_USAGE
         pts = args.unsafe_pts
-        if not pts.startswith("/dev/pts/"):
+        if not re.match(r"^/dev/pts/[0-9]+$", pts):
             eprint("claude-self-goal: --unsafe-pts must be a /dev/pts/N path")
             return EX_USAGE
     else:
@@ -226,18 +248,20 @@ def main(argv=None):
             return EX_NO_TARGET
 
     if args.dry_run:
-        print("method=tiocsti pts=%s line=%r (would require root)" % (pts, line))
+        print("method=tiocsti pts=%s line=%r (needs a context that permits TIOCSTI)" % (pts, line))
         return EX_OK
-
-    if os.geteuid() != 0:
-        eprint("claude-self-goal: TIOCSTI requires root (or CAP_SYS_ADMIN). Re-run as root,")
-        eprint("  or use a tmux session (send-keys needs no root).")
-        return EX_NOT_ROOT
 
     try:
         tiocsti_inject(pts, line + "\r")
-    except Exception as e:
-        eprint("claude-self-goal: TIOCSTI injection failed on %s: %s" % (pts, e))
+    except OSError as e:
+        # TIOCSTI depends on privilege AND kernel/container policy — diagnose both.
+        if os.geteuid() != 0:
+            eprint("claude-self-goal: TIOCSTI failed on %s (%s)." % (pts, e))
+            eprint("  It needs root or CAP_SYS_ADMIN. Re-run as root, or use tmux (no root).")
+            return EX_NOT_ROOT
+        eprint("claude-self-goal: TIOCSTI failed on %s (%s)." % (pts, e))
+        eprint("  Even as root this can be blocked by kernel config (legacy_tiocsti compiled")
+        eprint("  out), a seccomp filter, or a container/user-namespace policy.")
         return EX_INJECT_FAILED
     print("claude-self-goal: injected %r into %s" % (line, pts))
     return EX_OK

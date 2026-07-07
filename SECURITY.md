@@ -10,7 +10,7 @@ A local automation wrapper. It delivers the text `/goal <condition>` to a Claude
 
 It is **not** an exploit of a Claude Code bug or a kernel vulnerability — it uses documented, intended interfaces. But it **is** a privileged keystroke-injection wrapper, and that capability is inherently dual-use:
 
-- `TIOCSTI` pushes bytes into a terminal's input queue *as if typed*. With root / `CAP_SYS_ADMIN`, a process can do this to **any** pts on the host, not just its own. The same primitive has historically been used to escape restricted shells and inject commands into other users' terminals.
+- `TIOCSTI` pushes bytes into a terminal's input queue *as if typed*. With `CAP_SYS_ADMIN` (root), and unless the kernel/container policy blocks it, a process can do this to **any** pts on the host it can open — not just its own. The same primitive has historically been used to escape restricted shells and inject commands into other users' terminals.
 - This tool deliberately constrains itself to the Claude session in its own process ancestry (fail-closed discovery). That is a **usage** safeguard, not a kernel-enforced boundary. Root can always bypass it (that's what `--unsafe-pts` makes explicit).
 
 ## Rules

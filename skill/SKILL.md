@@ -30,4 +30,4 @@ Replace `claude-self-goal` with the absolute path if it is not on PATH (e.g. `/u
 - In tmux it uses `tmux send-keys` (no root). Otherwise it uses `TIOCSTI`, which needs root.
 - The condition is injected as a single line; control characters are rejected.
 - If it prints "no Claude Code session pts found", the session is headless (piped stdin) and cannot take an interactive `/goal`.
-- Once set, the `◎ /goal active` chip appears and the session will not stop until the condition is evaluated as met. It auto-clears on success — do not tell the user to run `/goal clear` after the goal is achieved.
+- Once set, the `◎ /goal active` chip appears and Claude Code's native goal evaluator should keep the session working until the condition is evaluated as met. It auto-clears on success — do not tell the user to run `/goal clear` after the goal is achieved.
