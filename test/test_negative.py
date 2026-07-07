@@ -42,6 +42,10 @@ check("unsafe-pts without ack rejected", r.returncode == 2, r.returncode)
 r = run(["--unsafe-pts", "/tmp/x", "--i-understand-this-can-inject-keystrokes", "g"])
 check("unsafe-pts non-pts path rejected", r.returncode == 2, r.returncode)
 
+# --unsafe-pts with a trailing newline -> usage error (regex must be anchored fully)
+r = run(["--unsafe-pts", "/dev/pts/999\n", "--i-understand-this-can-inject-keystrokes", "g"])
+check("unsafe-pts trailing newline rejected", r.returncode == 2, r.returncode)
+
 # --clear with a condition -> usage error
 r = run(["--clear", "a stray condition"])
 check("clear + condition rejected", r.returncode == 2, r.returncode)

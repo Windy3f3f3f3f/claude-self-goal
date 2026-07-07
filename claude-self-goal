@@ -235,7 +235,7 @@ def main(argv=None):
             eprint("claude-self-goal: --unsafe-pts requires --i-understand-this-can-inject-keystrokes")
             return EX_USAGE
         pts = args.unsafe_pts
-        if not re.match(r"^/dev/pts/[0-9]+$", pts):
+        if not re.fullmatch(r"/dev/pts/[0-9]+", pts):
             eprint("claude-self-goal: --unsafe-pts must be a /dev/pts/N path")
             return EX_USAGE
     else:
