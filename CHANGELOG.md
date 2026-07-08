@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1
+
+Fix a timing race in the attach path where the goal text landed in the input box
+but the Enter didn't submit it.
+
+- The leading `/` opens the slash-command menu; typing too fast and sending Enter
+  too soon let the still-open menu swallow the Enter. The attach path now types
+  more deliberately, waits for the menu to close, then verifies the goal actually
+  submitted by reading the session's screen (`◎ /goal active`) and retries Enter
+  a couple of times, reporting an error if it still can't confirm.
+
 ## 0.2.0
 
 Daemon/background session support, and a correctness fix for how sessions are targeted.

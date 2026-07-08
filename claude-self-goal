@@ -32,7 +32,7 @@ import os
 import re
 import sys
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 # exit codes
 EX_OK = 0
@@ -286,9 +286,16 @@ def attach_inject(session_id, line, connect_wait=6.0, settle=3.0):
             return 0
         return status if wpid == pid else None
 
+    captured = bytearray()
+    _ansi = re.compile(rb'\x1b\[[0-9;?]*[a-zA-Z]|\x1b\][^\x07]*(\x07|\x1b\\)|\x1b[>=()][A-Za-z0-9]?')
+
+    def screen_text():
+        t = _ansi.sub(b'', bytes(captured[-32768:]).replace(b'\r', b''))
+        return re.sub(r'\s+', '', t.decode('utf-8', 'replace')).lower()
+
     def drain(seconds):
-        """Read+discard output for up to `seconds`; stop early if the child exits.
-        Returns True if the child is still alive, False if it exited."""
+        """Read output for up to `seconds` (into `captured`); stop early if the
+        child exits. Returns True if the child is still alive, False if it exited."""
         end = time.time() + seconds
         while time.time() < end:
             if child_exit() is not None:
@@ -296,10 +303,14 @@ def attach_inject(session_id, line, connect_wait=6.0, settle=3.0):
             r, _, _ = select.select([master], [], [], 0.3)
             if r:
                 try:
-                    if not os.read(master, 65536):
-                        break
+                    c = os.read(master, 65536)
                 except OSError:
                     break
+                if not c:
+                    break
+                captured.extend(c)
+                if len(captured) > 131072:
+                    del captured[:-131072]
         return child_exit() is None
 
     def detach():
@@ -327,18 +338,45 @@ def attach_inject(session_id, line, connect_wait=6.0, settle=3.0):
     if not alive:
         detach()
         return "`claude attach %s` exited before we could inject (bad/unknown id?)" % session_id
+    # Type the line, then let the slash-command menu (opened by the leading `/`)
+    # settle before Enter. Typing too fast + sending Enter too soon loses the
+    # Enter to the still-open menu, so the text lands in the box but never
+    # submits — type deliberately and give the menu time to close.
     try:
         for ch in line.encode("utf-8"):
             os.write(master, bytes([ch]))
-            time.sleep(0.004)
-        time.sleep(0.4)
-        os.write(master, b"\r")
+            time.sleep(0.015)
+        time.sleep(0.8)
     except OSError as e:
         detach()
         return "writing to attach client failed: %s" % e
-    drain(settle)
+
+    is_clear = line.strip() == "/goal clear"
+
+    def confirmed():
+        t = screen_text()
+        if is_clear:
+            return "goalcleared" in t or "clearedthegoal" in t or "nogoaltoclear" in t
+        return "goalactive" in t  # the ◎ /goal active chip only appears once submitted
+
+    # Send Enter and verify it actually submitted; retry a couple of times.
+    ok = False
+    for _ in range(3):
+        del captured[:]
+        try:
+            os.write(master, b"\r")
+        except OSError as e:
+            detach()
+            return "writing Enter to attach client failed: %s" % e
+        if not drain(settle):  # child exited
+            break
+        if confirmed():
+            ok = True
+            break
     detach()
-    return None
+    if ok or is_clear:  # clear's confirmation text is unreliable — best-effort
+        return None
+    return "typed the /goal line but could not confirm it submitted (Enter/menu race)"
 
 
 def in_tmux():
